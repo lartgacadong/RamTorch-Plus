@@ -1,7 +1,8 @@
 from collections import OrderedDict
-from typing import Callable, Dict
+from typing import Callable, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 from .modules.linear import Linear
 
 
@@ -147,12 +148,17 @@ def register_ramtorch_post_accumulate_grad_hook(module, hook_fn, param_names=Non
 
 
 def move_model_to_device(
-    model: nn.Module, device: torch.device = torch.cuda.current_device()
+    model: nn.Module, device: Optional[torch.device] = None
 ):
     """
     Moves model parameters and buffers to the specified device,
     but skips any parameter or buffer that has `is_ramtorch = True`.
     """
+    if device is None:
+        if torch.cuda.is_available():
+            device = torch.cuda.current_device()
+        else:
+            raise RuntimeError("RamTorch move_model_to_device requires a CUDA device")
     for name, param in model.named_parameters(recurse=True):
         if getattr(param, "is_ramtorch", False):
             # Skip moving this param
@@ -251,3 +257,80 @@ def reattach_is_ramtorch_flags(module: nn.Module):
     # Recurse into children
     for child in module.children():
         reattach_is_ramtorch_flags(child)
+
+
+def _ramtorch_named_parameters(module: nn.Module) -> List[Tuple[str, nn.Parameter]]:
+    return [
+        (name, param)
+        for name, param in module.named_parameters()
+        if isinstance(param, nn.Parameter) and getattr(param, "is_ramtorch", False)
+    ]
+
+
+def _ramtorch_shared_metadata(param: nn.Parameter) -> Tuple[Tuple[bytes, bytes, int], Tuple[int, ...], Tuple[int, ...], torch.dtype]:
+    if param.device.type != "cpu":
+        raise ValueError(f"RamTorch parameter must live on CPU for sharing, got {param.device}")
+    storage = param.detach().untyped_storage()
+    handle = storage._share_filename_cpu_()
+    return handle, tuple(param.size()), tuple(param.stride()), param.dtype
+
+
+def _attach_shared_tensor(param: nn.Parameter, handle: Tuple[bytes, bytes, int], shape: Tuple[int, ...], stride: Tuple[int, ...], dtype: torch.dtype) -> None:
+    manager, name, size = handle
+    shared_storage = torch.UntypedStorage._new_shared_filename_cpu(manager, name, size)
+    shared_tensor = torch.empty(0, dtype=dtype)
+    shared_tensor.set_(shared_storage, 0, shape, stride)
+    param.data = shared_tensor
+    param.is_ramtorch = True
+
+
+def attach_shared_ramtorch_parameters(
+    module: nn.Module, process_group: Optional[dist.ProcessGroup] = None
+) -> int:
+    """
+    Rebind RamTorch parameters to shared CPU storage across independently launched processes.
+
+    Call this after torch.distributed has been initialized (e.g., in torchrun/Accelerate
+    entrypoints) so ramtorch parameters no longer rely on fork-based sharing.
+
+    Returns:
+        Number of RamTorch parameters that were attached to shared storage.
+    """
+    if not dist.is_available() or not dist.is_initialized():
+        return 0
+
+    group = process_group if process_group is not None else dist.group.WORLD
+    rank = dist.get_rank(group)
+    ramtorch_params = _ramtorch_named_parameters(module)
+    if not ramtorch_params:
+        return 0
+
+    metadata: List[Optional[Tuple[str, Tuple[bytes, bytes, int], Tuple[int, ...], Tuple[int, ...], torch.dtype]]] = [
+        None for _ in ramtorch_params
+    ]
+
+    if rank == 0:
+        for idx, (name, param) in enumerate(ramtorch_params):
+            handle, shape, stride, dtype = _ramtorch_shared_metadata(param)
+            metadata[idx] = (name, handle, shape, stride, dtype)
+
+    dist.broadcast_object_list(metadata, src=0, group=group)
+
+    attached = 0
+    for (name, param), entry in zip(ramtorch_params, metadata):
+        if entry is None:
+            continue
+        _, handle, shape, stride, dtype = entry
+
+        if rank != 0:
+            _attach_shared_tensor(param, handle, shape, stride, dtype)
+        else:
+            storage = param.detach().untyped_storage()
+            if not storage.is_shared():
+                param.data.share_memory_()
+
+        param.is_ramtorch = True
+        attached += 1
+
+    dist.barrier(group)
+    return attached

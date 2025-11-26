@@ -64,7 +64,7 @@ def create_zero_param_groups(param_groups, world_size):
     return rank_param_groups
 
 
-def broadcast_zero_params(rank_param_groups, async_op=True):
+def broadcast_zero_params(rank_param_groups, async_op=True, include_ramtorch=False):
     """
     Broadcast parameters from owner ranks to the rest of the ranks after grad sync and optim step.
 
@@ -72,18 +72,20 @@ def broadcast_zero_params(rank_param_groups, async_op=True):
         rank_param_groups: Dict mapping rank -> list of param groups for that rank
         async_op (bool): If True, performs non-blocking broadcasts and returns work handles.
                          Defaults to False (blocking operation).
+        include_ramtorch (bool): If True, also broadcast RamTorch CPU parameters. Defaults to False.
     """
     work_handles = []
     with torch.no_grad():
         for owner_rank, param_groups in rank_param_groups.items():
             for group in param_groups:
                 for param in group["params"]:
-                    if not getattr(param, "is_ramtorch", False):
-                        work_handle = dist.broadcast(
-                            param.data, src=owner_rank, async_op=async_op
-                        )
-                        if async_op:
-                            work_handles.append(work_handle)
+                    if getattr(param, "is_ramtorch", False) and not include_ramtorch:
+                        continue
+                    work_handle = dist.broadcast(
+                        param.data, src=owner_rank, async_op=async_op
+                    )
+                    if async_op:
+                        work_handles.append(work_handle)
 
         if not work_handles:
             return

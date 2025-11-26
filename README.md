@@ -182,6 +182,17 @@ if __name__ == "__main__":
     mp.spawn(train, args=(world_size, model), nprocs=world_size)
 ```
 
+If you launch workers independently (e.g., `torchrun` or HuggingFace Accelerate), share the CPU-backed RamTorch parameters explicitly after `dist.init_process_group`:
+
+```python
+from ramtorch.helpers import attach_shared_ramtorch_parameters
+
+# after init_process_group and model construction on each rank
+attached = attach_shared_ramtorch_parameters(model)
+# If you cannot use shared memory, set include_ramtorch=True when calling
+# broadcast_zero_params(...) so RamTorch parameters still stay in sync.
+```
+
 ## Performance Considerations
 
 ### When to Use RamTorch
