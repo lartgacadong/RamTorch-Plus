@@ -71,16 +71,20 @@ def broadcast_zero_params(rank_param_groups, async_op=True, include_ramtorch=Fal
     Args:
         rank_param_groups: Dict mapping rank -> list of param groups for that rank
         async_op (bool): If True, performs non-blocking broadcasts and returns work handles.
-                         Defaults to False (blocking operation).
-        include_ramtorch (bool): If True, also broadcast RamTorch CPU parameters. Defaults to False.
+                         Defaults to True (non-blocking operation).
+        include_ramtorch (bool): If False (default), skip broadcasting RamTorch parameters.
+                                 RamTorch parameters live in CPU shared memory and don't need
+                                 broadcasting. Set to True to include them anyway.
     """
     work_handles = []
     with torch.no_grad():
         for owner_rank, param_groups in rank_param_groups.items():
             for group in param_groups:
                 for param in group["params"]:
+                    # Skip ramtorch params unless explicitly included
                     if getattr(param, "is_ramtorch", False) and not include_ramtorch:
                         continue
+
                     work_handle = dist.broadcast(
                         param.data, src=owner_rank, async_op=async_op
                     )
