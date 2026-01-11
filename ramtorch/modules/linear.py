@@ -19,10 +19,15 @@ from torch.profiler import record_function  # just for profiling
 _DEVICE_STATE = {}
 
 
-def _get_device_state(device=torch.cuda.current_device()):
-    """Get or initialize per-device state."""
+def _get_device_state(device=None):
+    """Get or initialize per-device state (CUDA only)."""
+    if device is None:
+        device = torch.cuda.current_device()
     if isinstance(device, str):
         device = torch.device(device)
+
+    if device.type != "cuda":
+        raise RuntimeError("_get_device_state is CUDA-only")
 
     if device not in _DEVICE_STATE:
         with torch.cuda.device(device):
@@ -73,6 +78,27 @@ def _invoke_tensor_hooks(tensor, grad):
     return grad
 
 
+def _invoke_zero_2_tensor_hooks(tensor, grad):
+    """
+    Invoke backward hooks registered on a tensor.
+
+    Args:
+        tensor: The parameter tensor that may have hooks
+        grad: The gradient tensor to pass through hooks
+
+    Returns:
+        The potentially modified gradient after all hooks
+    """
+    # Standard backward hooks
+    if hasattr(tensor, "_ramtorch_zero_2_hooks") and tensor._ramtorch_zero_2_hooks:
+        for hook_id, hook_fn in tensor._ramtorch_zero_2_hooks.items():
+            result = hook_fn(grad)
+            if result is not None:
+                grad = result
+
+    return grad
+
+
 def _invoke_post_accum_tensor_hooks(tensor):
     """
     Invoke post accumulate grad hooks registered on a tensor.
@@ -97,12 +123,13 @@ class BouncingLinearFn(torch.autograd.Function):
     This function handles:
     1. Asynchronous transfer of weights from CPU to GPU
     2. Proper synchronization between transfer and compute streams
+    3. Manual dtype handling when inside autocast context
     """
 
     @staticmethod
     def forward(ctx, x, weight_cpu, bias_cpu, device="cuda"):
         """
-        Forward pass of bouncing linear layer.
+        Forward pass of bouncing linear layer with autocast support.
 
         Args:
             ctx: PyTorch autograd context for saving backward pass info
@@ -127,7 +154,33 @@ class BouncingLinearFn(torch.autograd.Function):
         transfer stream never overwrites buffers that the compute stream
         is still using.
         """
-        state = _get_device_state(device)
+        device_obj = torch.device(device)
+        device_type = device_obj.type
+
+        # Detect autocast state
+        autocast_enabled = torch.is_autocast_enabled()
+        autocast_dtype = (
+            torch.get_autocast_gpu_dtype() if autocast_enabled and device_type == "cuda" else None
+        )
+
+        if device_type != "cuda":
+            w = weight_cpu.to(device_obj)
+            b = bias_cpu.to(device_obj) if bias_cpu is not None else None
+            x_compute = x
+            if autocast_enabled:
+                x_compute = x_compute.to(autocast_dtype or x_compute.dtype)
+                w = w.to(autocast_dtype or w.dtype)
+                if b is not None:
+                    b = b.to(autocast_dtype or b.dtype)
+            out = F.linear(x_compute, w, b)
+            ctx.save_for_backward(x_compute, weight_cpu, bias_cpu)
+            ctx.device = device_obj
+            ctx.device_type = device_type
+            ctx.autocast_enabled = autocast_enabled
+            ctx.autocast_dtype = autocast_dtype
+            return out
+
+        state = _get_device_state(device_obj)
         transfer_stream = state["transfer_stream"]
         w_buffers = state["w_buffers"]
         b_buffers = state["b_buffers"]
@@ -151,9 +204,9 @@ class BouncingLinearFn(torch.autograd.Function):
 
                 # alternate between buffers to prevent race condition where the transfer stream
                 # overwriting the weight buffers before the main stream finish calculating the value
-                w_buffers[selected_buffer] = weight_cpu.to(device, non_blocking=True)
+                w_buffers[selected_buffer] = weight_cpu.to(device_obj, non_blocking=True)
                 b_buffers[selected_buffer] = (
-                    bias_cpu.to(device, non_blocking=True)
+                    bias_cpu.to(device_obj, non_blocking=True)
                     if bias_cpu is not None
                     else None
                 )
@@ -169,17 +222,34 @@ class BouncingLinearFn(torch.autograd.Function):
 
             # mark the start of compute event
             compute_forward_start_event.record()
-            out = F.linear(x, w_buffers[selected_buffer], b_buffers[selected_buffer])
+
+            # Manual casting when autocast is enabled
+            if autocast_enabled:
+                x_compute = x.to(autocast_dtype)
+                w_compute = w_buffers[selected_buffer].to(autocast_dtype)
+                b_compute = (
+                    b_buffers[selected_buffer].to(autocast_dtype)
+                    if b_buffers[selected_buffer] is not None
+                    else None
+                )
+                out = F.linear(x_compute, w_compute, b_compute)
+            else:
+                out = F.linear(
+                    x, w_buffers[selected_buffer], b_buffers[selected_buffer]
+                )
 
         # save for backward
         ctx.save_for_backward(x, weight_cpu, bias_cpu)
-        ctx.device = device
+        ctx.device = device_obj
+        ctx.device_type = device_type
+        ctx.autocast_enabled = autocast_enabled
+        ctx.autocast_dtype = autocast_dtype
         return out
 
     @staticmethod
     def backward(ctx, grad_out):
         """
-        Backward pass for gradient computation.
+        Backward pass for gradient computation with autocast support.
 
         Args:
             ctx: Autograd context containing saved forward pass data
@@ -201,12 +271,58 @@ class BouncingLinearFn(torch.autograd.Function):
             5. Asynchronously transfer the final accumulated gradients back to
                the .grad attribute of the CPU parameters.
 
-            Because this process bypasses the standard autograd mechanism for
-            parameters, this function returns None for the weight and bias
-            gradients. Hooks are manually invoked to maintain compatibility.
+        Because this process bypasses the standard autograd mechanism for
+        parameters, this function returns None for the weight and bias
+        gradients. Hooks are manually invoked to maintain compatibility.
         """
         x, weight_cpu, bias_cpu = ctx.saved_tensors
         device = ctx.device
+        device_type = ctx.device_type
+
+        if device_type != "cuda":
+            # Compute synchronously on the target device (e.g., MPS or CPU) without CUDA streams.
+            w_dev = weight_cpu.to(device)
+            if ctx.autocast_enabled and ctx.autocast_dtype is not None:
+                grad_out_compute = grad_out.to(ctx.autocast_dtype)
+                x_compute = x.to(ctx.autocast_dtype)
+                w_compute = w_dev.to(ctx.autocast_dtype)
+            else:
+                grad_out_compute = grad_out
+                x_compute = x
+                w_compute = w_dev
+
+            grad_input = grad_out_compute @ w_compute
+            w_grad = grad_out_compute.flatten(0, -2).T @ x_compute.flatten(0, -2)
+
+            w_grad = _invoke_tensor_hooks(weight_cpu, w_grad)
+            if weight_cpu.grad is not None:
+                w_grad += weight_cpu.grad.to(w_grad)
+            weight_cpu.ramtorch_grad = w_grad
+            _invoke_post_accum_tensor_hooks(weight_cpu)
+            del weight_cpu.ramtorch_grad
+
+            if bias_cpu is not None:
+                reduce_dims = tuple(range(grad_out.ndim - 1))
+                b_grad = grad_out.sum(dim=reduce_dims)
+                b_grad = _invoke_tensor_hooks(bias_cpu, b_grad)
+                if bias_cpu.grad is not None:
+                    b_grad += bias_cpu.grad.to(b_grad)
+                bias_cpu.ramtorch_grad = b_grad
+                _invoke_post_accum_tensor_hooks(bias_cpu)
+                del bias_cpu.ramtorch_grad
+            else:
+                b_grad = None
+
+            # Apply ZeRO-2 hooks before storing grads
+            w_grad = _invoke_zero_2_tensor_hooks(weight_cpu, w_grad)
+            b_grad = _invoke_zero_2_tensor_hooks(bias_cpu, b_grad)
+
+            weight_cpu.grad = w_grad.to("cpu")
+            if bias_cpu is not None and b_grad is not None:
+                bias_cpu.grad = b_grad.to("cpu")
+
+            return grad_input, None, None, None
+
         state = _get_device_state(device)
         transfer_stream = state["transfer_stream"]
         transfer_grad_stream = state["transfer_grad_stream"]
@@ -268,16 +384,33 @@ class BouncingLinearFn(torch.autograd.Function):
         with record_function(
             "backward_linear_compute"
         ):  # for profiling and easy debugging
-            # compute input grad
-            grad_input = grad_out @ w_bwd_buffers[selected_buffer]
+            # Manual casting for backward when autocast is enabled
+            if ctx.autocast_enabled:
+                grad_out_compute = grad_out.to(ctx.autocast_dtype)
+                x_compute = x.to(ctx.autocast_dtype)
+                w_compute = w_bwd_buffers[selected_buffer].to(ctx.autocast_dtype)
 
-            # this must launch after the transfer stream is done
-            torch.cuda.current_stream().wait_event(
-                transfer_weight_backward_finished_event
-            )
-            w_grad_buffers[selected_buffer] = grad_out.flatten(0, -2).T @ x.flatten(
-                0, -2
-            )
+                # compute input grad
+                grad_input = grad_out_compute @ w_compute
+
+                # this must launch after the transfer stream is done
+                torch.cuda.current_stream().wait_event(
+                    transfer_weight_backward_finished_event
+                )
+                w_grad_buffers[selected_buffer] = (
+                    grad_out_compute.flatten(0, -2).T @ x_compute.flatten(0, -2)
+                ).to(weight_cpu.dtype)
+            else:
+                # compute input grad
+                grad_input = grad_out @ w_bwd_buffers[selected_buffer]
+
+                # this must launch after the transfer stream is done
+                torch.cuda.current_stream().wait_event(
+                    transfer_weight_backward_finished_event
+                )
+                w_grad_buffers[selected_buffer] = grad_out.flatten(0, -2).T @ x.flatten(
+                    0, -2
+                )
 
             # gradient accumulation is being performed directly
             with record_function(
@@ -305,7 +438,14 @@ class BouncingLinearFn(torch.autograd.Function):
             if bias_cpu is not None:
                 # sum over all batch-like dims, keep only last dim (Out)
                 reduce_dims = tuple(range(grad_out.ndim - 1))
-                b_grad_buffers[selected_buffer] = grad_out.sum(dim=reduce_dims)
+
+                # Keep bias gradient in fp32 for numerical stability when autocast is enabled
+                if ctx.autocast_enabled:
+                    b_grad_buffers[selected_buffer] = (
+                        grad_out.float().sum(dim=reduce_dims).to(bias_cpu.dtype)
+                    )
+                else:
+                    b_grad_buffers[selected_buffer] = grad_out.sum(dim=reduce_dims)
 
                 with record_function(
                     "backward_bias_grad_accumulate"
@@ -339,17 +479,26 @@ class BouncingLinearFn(torch.autograd.Function):
             with torch.cuda.stream(transfer_grad_stream):
                 transfer_grad_stream.wait_event(compute_backward_finished_event)
                 # TODO: put zero 2 hooks here and only store grad w.r.t to the assigned gpu
-                # transfer_weight_backward_start_event.record()
-                weight_cpu.grad = w_grad_buffers[selected_buffer].to(
-                    "cpu", non_blocking=True
+
+                w_grad_buffers[selected_buffer] = _invoke_zero_2_tensor_hooks(
+                    weight_cpu, w_grad_buffers[selected_buffer]
                 )
+                b_grad_buffers[selected_buffer] = _invoke_zero_2_tensor_hooks(
+                    bias_cpu, b_grad_buffers[selected_buffer]
+                )
+                # transfer_weight_backward_start_event.record()
+                if w_grad_buffers[selected_buffer] is not None:
+                    weight_cpu.grad = w_grad_buffers[selected_buffer].to(
+                        "cpu", non_blocking=True
+                    )
 
                 if bias_cpu is not None:
-                    bias_cpu.grad = (
-                        b_grad_buffers[selected_buffer].to("cpu", non_blocking=True)
-                        if bias_cpu is not None
-                        else None
-                    )
+                    if b_grad_buffers[selected_buffer] is not None:
+                        bias_cpu.grad = (
+                            b_grad_buffers[selected_buffer].to("cpu", non_blocking=True)
+                            if bias_cpu is not None
+                            else None
+                        )
 
                 # record when transfer is done
                 transfer_weight_backward_finished_event.record()
@@ -396,7 +545,8 @@ class CPUBouncingLinear(nn.Module):
         out_features,
         bias=True,
         dtype=None,
-        device=torch.cuda.current_device(),
+        device=None,
+        skip_init=False,
     ):
         """
         Initialize CPU linear layer.
@@ -414,19 +564,29 @@ class CPUBouncingLinear(nn.Module):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
+        if device is None:
+            if torch.cuda.is_available():
+                device = torch.cuda.current_device()
+            elif torch.backends.mps.is_available():
+                device = torch.device("mps")
+            else:
+                device = torch.device("cpu")
         self.device = device
         if dtype is None:
             dtype = torch.float32
 
+        self.is_ramtorch = True
+        pin_memory = torch.cuda.is_available()
         # parameters live on CPU
-        self.weight = nn.Parameter(
-            torch.empty(
-                out_features, in_features, dtype=dtype, device="cpu"
-            ).pin_memory()
+        weight = torch.empty(
+            out_features, in_features, dtype=dtype, device="cpu", pin_memory=pin_memory
         )
+        self.weight = nn.Parameter(weight)
         self.bias = (
             nn.Parameter(
-                torch.empty(out_features, dtype=dtype, device="cpu").pin_memory()
+                torch.empty(
+                    out_features, dtype=dtype, device="cpu", pin_memory=pin_memory
+                )
             )
             if bias
             else None
@@ -438,11 +598,39 @@ class CPUBouncingLinear(nn.Module):
             self.bias.is_ramtorch = True
 
         # init
-        nn.init.kaiming_uniform_(self.weight, a=5**0.5)
-        if self.bias is not None:
-            fan_in = in_features
-            bound = 1 / fan_in**0.5
-            nn.init.uniform_(self.bias, -bound, bound)
+        if not skip_init:
+            nn.init.kaiming_uniform_(self.weight, a=5**0.5)
+            if self.bias is not None:
+                fan_in = in_features
+                bound = 1 / fan_in**0.5
+                nn.init.uniform_(self.bias, -bound, bound)
+
+    def _apply(self, fn):
+        """
+        Override _apply to allow dtype changes but prevent device moves.
+        """
+        # Test what fn does with a dummy tensor on CPU
+        dummy = torch.tensor(0.0, device="cpu", dtype=self.weight.dtype)
+        result = fn(dummy)
+
+        # If dtype changed, apply it (but keep on CPU)
+        if result.dtype != dummy.dtype:
+            new_dtype = result.dtype
+            self.weight.data = self.weight.data.to(dtype=new_dtype)
+            if self.bias is not None:
+                self.bias.data = self.bias.data.to(dtype=new_dtype)
+
+        # Ignore any device changes by always staying on CPU
+        del dummy
+        return self
+
+    def cuda(self, device=None):
+        """Override .cuda() to no-op."""
+        return self
+
+    def cpu(self):
+        """Override .cpu() to no-op (already on CPU)."""
+        return self
 
     def forward(self, x):
         """
