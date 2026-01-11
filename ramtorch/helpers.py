@@ -358,7 +358,7 @@ def attach_shared_ramtorch_parameters(
     return attached
 
 
-# --- New extension layer replacement functions ---
+# --- Extension layer replacement functions ---
 
 def replace_embedding_with_ramtorch(module: nn.Module, device: str = "cuda"):
     """
